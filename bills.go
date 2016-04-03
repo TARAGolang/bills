@@ -1,142 +1,187 @@
 /*
- * look at costs csv and output report
+ * Look at bills listed in a CSV and output a report.
+ *
+ * CSV lines look like:
+ * YYYY-MM-DD,Store 123,10.00,Note about this
+ *
+ * TODO Don't handle money with floats
  */
 
 package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
+// Cost is a parsed CSV line.
 type Cost struct {
+	Time   time.Time
+	Source string
+	Amount float64
+	Note   string
+}
+
+func (c Cost) String() string {
+	return fmt.Sprintf("%s: %.2f", c.Source, c.Amount)
+}
+
+type GroupedCost struct {
 	Name   string
 	Amount float64
 }
 
-func (c Cost) String() string {
+func (c GroupedCost) String() string {
 	return fmt.Sprintf("%s: %.2f", c.Name, c.Amount)
 }
 
-type ByAmount []Cost
+type CostByTime []Cost
 
-func (c ByAmount) Len() int           { return len(c) }
-func (c ByAmount) Swap(i, j int)      { c[i], c[j] = c[j], c[i] }
-func (c ByAmount) Less(i, j int) bool { return c[i].Amount > c[j].Amount }
+func (m CostByTime) Len() int           { return len(m) }
+func (m CostByTime) Swap(i, j int)      { m[i], m[j] = m[j], m[i] }
+func (m CostByTime) Less(i, j int) bool { return m[i].Time.Before(m[j].Time) }
 
-type ByMonth []string
+type GroupedCostByAmount []GroupedCost
 
-func (m ByMonth) Len() int      { return len(m) }
-func (m ByMonth) Swap(i, j int) { m[i], m[j] = m[j], m[i] }
-func (m ByMonth) Less(i, j int) bool {
-	iParts := strings.Split(m[i], "-")
-	iYear64, _ := strconv.ParseInt(iParts[0], 10, 0)
-	iMonth64, _ := strconv.ParseInt(iParts[1], 10, 0)
+func (c GroupedCostByAmount) Len() int           { return len(c) }
+func (c GroupedCostByAmount) Swap(i, j int)      { c[i], c[j] = c[j], c[i] }
+func (c GroupedCostByAmount) Less(i, j int) bool { return c[i].Amount > c[j].Amount }
 
-	jParts := strings.Split(m[j], "-")
-	jYear64, _ := strconv.ParseInt(jParts[0], 10, 0)
-	jMonth64, _ := strconv.ParseInt(jParts[1], 10, 0)
-
-	if iYear64 < jYear64 {
-		return true
-	}
-	if iYear64 > jYear64 {
-		return false
-	}
-	if iMonth64 < jMonth64 {
-		return true
-	}
-	return false
-}
-
+// main is the program entry!
 func main() {
-	// log output format. 0 to be very minimal - no prefix.
+	// Log output format. 0 to be very minimal - no prefix.
 	log.SetFlags(0)
 
-	sourceToAmount := make(map[string]float64)
-	monthToAmount := make(map[string]float64)
-	monthToNameToAmount := make(map[string]map[string]float64)
+	csv := flag.String("csv", "", "CSV file to read.")
+	locationString := flag.String("location", "America/Vancouver", "Time zone location.")
 
-	file, err := os.Open("costs.csv")
-	if err != nil {
-		log.Printf("Unable to open: %s", err.Error())
+	flag.Parse()
+
+	if len(*csv) == 0 {
+		log.Print("You must specify a CSV file.")
+		flag.PrintDefaults()
 		os.Exit(1)
 	}
 
-	scanner := bufio.NewScanner(file)
+	if len(*locationString) == 0 {
+		log.Print("You must specify a location.")
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+
+	location, err := time.LoadLocation(*locationString)
+	if err != nil {
+		log.Printf("Invalid location: %s", err.Error())
+		os.Exit(1)
+	}
+
+	costs, err := readCostsCSV(*csv, location)
+	if err != nil {
+		log.Printf("Unable to read costs: %s", err.Error())
+		os.Exit(1)
+	}
+
+	sourceToAmount := tallyCosts(costs)
+	total := getTotal(costs)
+
+	reportCosts(costs, total, sourceToAmount)
+}
+
+// readCostsCSV reads in a CSV and parses each line as a Cost.
+func readCostsCSV(file string, location *time.Location) ([]Cost, error) {
+	fh, err := os.Open(file)
+	if err != nil {
+		return nil, fmt.Errorf("Unable to open: %s: %s", file, err.Error())
+	}
+	defer fh.Close()
+
+	scanner := bufio.NewScanner(fh)
+
+	timeLayout := "2006-01-02"
+
+	var costs []Cost
 
 	for scanner.Scan() {
 		line := scanner.Text()
 
 		pieces := strings.Split(line, ",")
 		if len(pieces) != 4 {
-			log.Printf("Invalid line: %s", line)
-			os.Exit(1)
+			return nil, fmt.Errorf("Line missing expected number of fields: %s", line)
 		}
 
 		date := pieces[0]
 		source := pieces[1]
 		amount := pieces[2]
-		//desc := pieces[3]
+		note := pieces[3]
+
+		costTime, err := time.ParseInLocation(timeLayout, date, location)
+		if err != nil {
+			return nil, fmt.Errorf("Unable to parse date: %s: %s", date, err.Error())
+		}
 
 		amountFloat, err := strconv.ParseFloat(amount, 64)
 		if err != nil {
-			log.Printf("Invalid amount: %s: %s", amount, err.Error())
-			os.Exit(1)
+			return nil, fmt.Errorf("Unable to parse amount: %s: %s", amount,
+				err.Error())
 		}
 
-		dateParts := strings.Split(date, "-")
-		if len(dateParts) != 3 {
-			log.Fatalf("Invalid date: %s", date)
-		}
-		month := dateParts[0] + "-" + dateParts[1]
-
-		// Overall total
-		_, ok := sourceToAmount[source]
-		if !ok {
-			sourceToAmount[source] = float64(0)
-		}
-		sourceToAmount[source] += amountFloat
-
-		// Month total
-		_, ok = monthToAmount[month]
-		if !ok {
-			monthToAmount[month] = float64(0)
-		}
-		monthToAmount[month] += amountFloat
-
-		_, ok = monthToNameToAmount[month]
-		if !ok {
-			monthToNameToAmount[month] = make(map[string]float64)
-		}
-		_, ok = monthToNameToAmount[month][source]
-		if !ok {
-			monthToNameToAmount[month][source] = float64(0)
-		}
-		monthToNameToAmount[month][source] += amountFloat
+		costs = append(costs, Cost{
+			Time:   costTime,
+			Source: source,
+			Amount: amountFloat,
+			Note:   note,
+		})
 	}
 
-	// Pull out to slice for sorting
-	var totalCosts []Cost
+	if scanner.Err() != nil {
+		return nil, fmt.Errorf("Scanner error: %s", scanner.Err().Error())
+	}
+
+	return costs, nil
+}
+
+// getTotal totals up the costs
+func getTotal(costs []Cost) float64 {
 	total := float64(0)
-	for key, value := range sourceToAmount {
-		cost := Cost{
-			Name:   key,
-			Amount: value,
+	for _, cost := range costs {
+		total += cost.Amount
+	}
+	return total
+}
+
+// tallyCosts builds some totals from the costs.
+func tallyCosts(costs []Cost) map[string]GroupedCost {
+	sourceToAmount := make(map[string]GroupedCost)
+
+	for _, cost := range costs {
+		_, ok := sourceToAmount[cost.Source]
+		if !ok {
+			sourceToAmount[cost.Source] = GroupedCost{Name: cost.Source}
 		}
-		totalCosts = append(totalCosts, cost)
-		total += value
+		sourceToAmount[cost.Source] = GroupedCost{
+			Name:   cost.Source,
+			Amount: sourceToAmount[cost.Source].Amount + cost.Amount,
+		}
 	}
 
-	sort.Sort(ByAmount(totalCosts))
+	return sourceToAmount
+}
 
-	log.Printf("Overall totals:")
-	for _, value := range totalCosts {
+// reportCosts outputs a report.
+func reportCosts(costs []Cost, total float64,
+	sourceToAmount map[string]GroupedCost) {
+	// Output all costs, ordered by amount descending.
+	sort.Sort(CostByTime(costs))
+
+	log.Printf("Costs:")
+	for _, value := range costs {
 		log.Print(value)
 	}
 	log.Printf("")
@@ -146,39 +191,15 @@ func main() {
 	log.Printf("----")
 	log.Printf("")
 
-	// Pull out to slice for sorting
-	var months []string
-	for key, _ := range monthToAmount {
-		months = append(months, key)
+	// Output totals of bill sources, ordered by amount descending.
+	var groupedCosts []GroupedCost
+	for _, groupedCost := range sourceToAmount {
+		groupedCosts = append(groupedCosts, groupedCost)
 	}
+	sort.Sort(GroupedCostByAmount(groupedCosts))
 
-	sort.Sort(ByMonth(months))
-
-	log.Printf("By month:")
-	for _, month := range months {
-		amount := monthToAmount[month]
-		log.Printf("%s: %.2f", month, amount)
-	}
-
-	log.Printf("")
-	log.Printf("----")
-	log.Printf("")
-
-	log.Printf("Source by month:")
-	for _, month := range months {
-		sourceToAmount := monthToNameToAmount[month]
-		log.Printf("%s", month)
-
-		// Pull out costs to slice for sorting
-		var costs []Cost
-		for source, amount := range sourceToAmount {
-			cost := Cost{Name: source, Amount: amount}
-			costs = append(costs, cost)
-		}
-		sort.Sort(ByAmount(costs))
-
-		for _, value := range costs {
-			log.Printf("    %s", value)
-		}
+	log.Print("Grouped costs:")
+	for _, value := range groupedCosts {
+		log.Print(value)
 	}
 }
