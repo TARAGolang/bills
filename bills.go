@@ -30,7 +30,8 @@ type Cost struct {
 }
 
 func (c Cost) String() string {
-	return fmt.Sprintf("%s: %.2f", c.Source, c.Amount)
+	return fmt.Sprintf("%s %s: %.2f", c.Time.Format("2006-01-02"), c.Source,
+		c.Amount)
 }
 
 type GroupedCost struct {
@@ -61,6 +62,7 @@ func main() {
 
 	csv := flag.String("csv", "", "CSV file to read.")
 	locationString := flag.String("location", "America/Vancouver", "Time zone location.")
+	daysBack := flag.Int("days-back", 30, "Number of days back to include in the report. Entries older than this will be ignored.")
 
 	flag.Parse()
 
@@ -76,13 +78,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	if *daysBack <= 0 {
+		log.Print("You must provide a number of days back >= 0.")
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+
 	location, err := time.LoadLocation(*locationString)
 	if err != nil {
 		log.Printf("Invalid location: %s", err.Error())
 		os.Exit(1)
 	}
 
-	costs, err := readCostsCSV(*csv, location)
+	filterDuration := time.Duration(*daysBack*24) * time.Hour
+
+	costs, err := readCostsCSV(*csv, location, filterDuration)
 	if err != nil {
 		log.Printf("Unable to read costs: %s", err.Error())
 		os.Exit(1)
@@ -95,7 +105,8 @@ func main() {
 }
 
 // readCostsCSV reads in a CSV and parses each line as a Cost.
-func readCostsCSV(file string, location *time.Location) ([]Cost, error) {
+func readCostsCSV(file string, location *time.Location,
+	filterDuration time.Duration) ([]Cost, error) {
 	fh, err := os.Open(file)
 	if err != nil {
 		return nil, fmt.Errorf("Unable to open: %s: %s", file, err.Error())
@@ -105,6 +116,9 @@ func readCostsCSV(file string, location *time.Location) ([]Cost, error) {
 	scanner := bufio.NewScanner(fh)
 
 	timeLayout := "2006-01-02"
+
+	filterTime := time.Now().Truncate(24 * time.Hour).Add(-filterDuration)
+	log.Printf("Ignoring any entries < %s", filterTime.Format("2006-01-02"))
 
 	var costs []Cost
 
@@ -124,6 +138,10 @@ func readCostsCSV(file string, location *time.Location) ([]Cost, error) {
 		costTime, err := time.ParseInLocation(timeLayout, date, location)
 		if err != nil {
 			return nil, fmt.Errorf("Unable to parse date: %s: %s", date, err.Error())
+		}
+
+		if costTime.Before(filterTime) {
+			continue
 		}
 
 		amountFloat, err := strconv.ParseFloat(amount, 64)
